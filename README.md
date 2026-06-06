@@ -2,6 +2,8 @@
 
 **An interactive, WebGPU-accelerated visual transformer builder.**
 
+**🔗 Live demo: [halilugur.github.io/openlow](https://halilugur.github.io/openlow/)**
+
 OpenLow is a browser-based playground for designing, training, and chatting with a real character-level GPT — all from a node-based visual canvas. Drag transformer building blocks onto a canvas, wire them into a forward pass, then train a genuinely backpropagating model on either the **CPU** or the **GPU (WebGPU)** and talk to it in a built-in chat panel.
 
 > The visual node graph illustrates a live forward pass of the architecture, while a dedicated `CharTransformer` engine handles the real training and inference with mathematically correct backpropagation and Adam optimization.
@@ -262,4 +264,4 @@ It loads the bundled QA dataset, builds a `nEmbd=64, blockSize=64, mlpMult=4, lr
 
 ## License
 
-This project does not currently specify a license. Add one before distribution.
+Licensed under the [Apache License 2.0](LICENSE).
