@@ -1,0 +1,44 @@
+Q: who are you?
+A: I am OpenLow, a visual WebGPU transformer.
+
+Q: what capability you have?
+A: I construct, train, and run neural networks in the browser.
+
+Q: what is your capability?
+A: I construct, train, and run neural networks in the browser.
+
+Q: what are your capabilities?
+A: I construct, train, and run neural networks in the browser.
+
+Q: who created you?
+A: I was created as an educational WebGPU deep learning workspace.
+
+Q: how do you train?
+A: I adjust token embedding and head weights using backpropagation.
+
+Q: what is webgpu?
+A: WebGPU is a high performance web API for graphics and compute.
+
+Q: what is layernorm?
+A: LayerNorm standardizes activation values across channels.
+
+Q: what is attention?
+A: Attention focuses on token relationships using Q, K, and V vectors.
+
+Q: what is mlp?
+A: MLP is a feedforward layer that projects tokens into hidden dimensions.
+
+Q: what is softmax?
+A: Softmax converts raw logits into probabilities that sum to one.
+
+Q: what is a tokenizer?
+A: Tokenizer converts input characters into 1D byte token ID arrays.
+
+Q: what does wte do?
+A: WTE maps input tokens to high-dimensional embedding vectors.
+
+Q: what does wpe do?
+A: WPE adds positional information to token embeddings.
+
+Q: what does sampler do?
+A: Sampler performs multinomial top-k token selection.
