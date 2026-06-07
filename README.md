@@ -4,6 +4,8 @@
 
 **🔗 Live demo: [halilugur.github.io/openlow](https://halilugur.github.io/openlow/)**
 
+![OpenLow Homepage](./public/image.png)
+
 OpenLow is a browser-based playground for designing, training, and chatting with a real character-level GPT — all from a node-based visual canvas. Drag transformer building blocks onto a canvas, wire them into a forward pass, then train a genuinely backpropagating model on either the **CPU** or the **GPU (WebGPU)** and talk to it in a built-in chat panel.
 
 > **The canvas IS the model.** When you press Train, the node graph you wired is compiled into a concrete architecture — the number of Transformer blocks, embedding dimension, context window, and MLP expansion are all read from your nodes — and a `CharTransformer` engine trains exactly that structure with mathematically correct backpropagation and Adam optimization. Change the canvas, retrain, and the real model changes with it.
