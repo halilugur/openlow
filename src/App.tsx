@@ -10,6 +10,7 @@ import type { Tensor } from './engine/webgpuEngine';
 import { ByteTokenizer } from './engine/tokenizer';
 import { CharTransformer } from './engine/cpuTransformer';
 import { GpuTransformer } from './engine/gpuTransformer';
+import { compileGraph } from './engine/graphCompiler';
 import { SparkleIcon } from '@phosphor-icons/react';
 import qaText from './assets/training.data?raw';
 
@@ -1015,15 +1016,30 @@ function App() {
       return;
     }
 
+    // The canvas IS the model: compile the node graph you wired into a concrete
+    // architecture and validate its topology. If the graph is incomplete or
+    // mis-wired we block training and explain exactly what to fix.
+    const compiled = compileGraph(nodes, edges);
+    if (!compiled.config) {
+      addLog('error', 'Cannot train — your canvas architecture is incomplete:');
+      for (const msg of compiled.errors) addLog('error', `  • ${msg}`);
+      return;
+    }
+    const arch = compiled.config;
+
     setIsTraining(true);
     setIsModelTrained(false);
     clearLogs();
 
-    // (Re)build a fresh model over this dataset's vocabulary.
+    addLog('info', `Architecture compiled from canvas — nEmbd ${arch.nEmbd} | block ${arch.blockSize} | mlp x${arch.mlpMult} | blocks ${arch.nLayer}.`);
+    for (const w of compiled.warnings) addLog('warning', w);
+
+    // (Re)build a fresh model whose architecture is read from the canvas graph.
     const model = new CharTransformer({
-      nEmbd: trainParams.nEmbd,
-      blockSize: trainParams.blockSize,
-      mlpMult: trainParams.mlpMult,
+      nEmbd: arch.nEmbd,
+      blockSize: arch.blockSize,
+      mlpMult: arch.mlpMult,
+      nLayer: arch.nLayer,
       lr: trainParams.lr,
     });
     model.setText(text);
@@ -1037,6 +1053,13 @@ function App() {
     // diverges or errors, we transparently fall back to the CPU trainer.
     let backend = computeBackendRef.current;
     let gpu: GpuTransformer | null = null;
+
+    // The WebGPU mirror only implements a single Transformer block. For deeper
+    // architectures wired on the canvas, train on the (block-agnostic) CPU engine.
+    if (backend === 'webgpu' && arch.nLayer > 1) {
+      addLog('warning', `WebGPU supports single-block models only — training this ${arch.nLayer}-block architecture on CPU.`);
+      backend = 'cpu';
+    }
 
     if (backend === 'webgpu') {
       const device = engineRef.current?.device ?? null;
@@ -1084,8 +1107,8 @@ function App() {
     }
 
     addLog('info', `Training real transformer on ${text.length} chars | vocab ${model.vocab} | ${steps} steps | backend: ${backend.toUpperCase()}`);
-    addLog('info', `Hyperparameters: nEmbd ${trainParams.nEmbd} | block ${trainParams.blockSize} | mlp x${trainParams.mlpMult} | lr ${trainParams.lr} | batch ${batch}`);
-    addLog('info', 'Architecture: WTE+WPE -> LN -> Self-Attention -> MLP(GELU) -> LN -> Head | Optimizer: Adam');
+    addLog('info', `Hyperparameters: nEmbd ${arch.nEmbd} | block ${arch.blockSize} | mlp x${arch.mlpMult} | blocks ${arch.nLayer} | lr ${trainParams.lr} | batch ${batch}`);
+    addLog('info', `Architecture: WTE+WPE -> [LN -> Self-Attention -> MLP(GELU) -> LN] x${arch.nLayer} -> LN -> Head | Optimizer: Adam`);
 
     try {
       const t0 = performance.now();

@@ -14,6 +14,7 @@ export interface TransformerConfig {
   nEmbd: number;     // embedding / channel dimension (C)
   blockSize: number; // max context length (T)
   mlpMult: number;   // MLP hidden expansion factor
+  nLayer: number;    // number of stacked Transformer blocks
   lr: number;        // Adam learning rate
 }
 
@@ -21,6 +22,7 @@ const DEFAULT_CONFIG: TransformerConfig = {
   nEmbd: 64,
   blockSize: 64,
   mlpMult: 4,
+  nLayer: 1,
   lr: 0.003,
 };
 
@@ -91,6 +93,53 @@ class Param {
   }
 }
 
+// One Transformer block: LayerNorm -> single-head causal self-attention ->
+// residual -> LayerNorm -> MLP(GELU) -> residual. Stacking N of these (one per
+// Attention node on the canvas) builds a deeper model.
+class Block {
+  ln1g: Param; ln1b: Param;
+  Wq: Param; bq: Param;
+  Wk: Param; bk: Param;
+  Wv: Param; bv: Param;
+  Wo: Param; bo: Param;
+  ln2g: Param; ln2b: Param;
+  W1: Param; b1: Param;
+  W2: Param; b2: Param;
+  constructor(C: number, H: number, s: number) {
+    this.ln1g = new Param(C, 0); this.ln1g.data.fill(1);
+    this.ln1b = new Param(C, 0);
+    this.Wq = new Param(C * C, s); this.bq = new Param(C, 0);
+    this.Wk = new Param(C * C, s); this.bk = new Param(C, 0);
+    this.Wv = new Param(C * C, s); this.bv = new Param(C, 0);
+    this.Wo = new Param(C * C, s); this.bo = new Param(C, 0);
+    this.ln2g = new Param(C, 0); this.ln2g.data.fill(1);
+    this.ln2b = new Param(C, 0);
+    this.W1 = new Param(C * H, s); this.b1 = new Param(H, 0);
+    this.W2 = new Param(H * C, s); this.b2 = new Param(C, 0);
+  }
+  params(): Param[] {
+    return [
+      this.ln1g, this.ln1b,
+      this.Wq, this.bq, this.Wk, this.bk, this.Wv, this.bv, this.Wo, this.bo,
+      this.ln2g, this.ln2b, this.W1, this.b1, this.W2, this.b2,
+    ];
+  }
+}
+
+// Cached activations for one block's forward pass, needed for backprop.
+interface LnCache { y: Float32Array; xhat: Float32Array; rstd: Float32Array; }
+interface BlockCache {
+  xin: Float32Array;   // block input (= residual stream entering the block)
+  ln1: LnCache;
+  q: Float32Array; k: Float32Array; v: Float32Array;
+  att: Float32Array;   // attention weights [n, n]
+  attOut: Float32Array;
+  x1: Float32Array;    // after residual 1
+  ln2: LnCache;
+  fc: Float32Array;    // pre-activation MLP hidden [n, H]
+  act: Float32Array;   // post-GELU hidden [n, H]
+}
+
 export class CharTransformer {
   cfg: TransformerConfig;
   // vocabulary
@@ -101,16 +150,28 @@ export class CharTransformer {
   // parameters
   wte!: Param; // [V, C]
   wpe!: Param; // [T, C]
-  ln1g!: Param; ln1b!: Param;
-  Wq!: Param; bq!: Param;
-  Wk!: Param; bk!: Param;
-  Wv!: Param; bv!: Param;
-  Wo!: Param; bo!: Param;
-  ln2g!: Param; ln2b!: Param;
-  W1!: Param; b1!: Param;
-  W2!: Param; b2!: Param;
+  blocks: Block[] = []; // one entry per Transformer block (nLayer)
   lnfg!: Param; lnfb!: Param;
   Whead!: Param; bhead!: Param;
+
+  // Block-0 accessors. The single-block GPU mirror and the GPU/CPU parity check
+  // read these flat names; for multi-block models they reference the first block.
+  get ln1g() { return this.blocks[0].ln1g; }
+  get ln1b() { return this.blocks[0].ln1b; }
+  get Wq() { return this.blocks[0].Wq; }
+  get bq() { return this.blocks[0].bq; }
+  get Wk() { return this.blocks[0].Wk; }
+  get bk() { return this.blocks[0].bk; }
+  get Wv() { return this.blocks[0].Wv; }
+  get bv() { return this.blocks[0].bv; }
+  get Wo() { return this.blocks[0].Wo; }
+  get bo() { return this.blocks[0].bo; }
+  get ln2g() { return this.blocks[0].ln2g; }
+  get ln2b() { return this.blocks[0].ln2b; }
+  get W1() { return this.blocks[0].W1; }
+  get b1() { return this.blocks[0].b1; }
+  get W2() { return this.blocks[0].W2; }
+  get b2() { return this.blocks[0].b2; }
 
   params: Param[] = [];
   tokens: number[] = [];
@@ -147,26 +208,18 @@ export class CharTransformer {
     const T = this.cfg.blockSize;
     const V = this.vocab;
     const H = C * this.cfg.mlpMult;
+    const nLayer = Math.max(1, this.cfg.nLayer);
     const s = 0.02;
     this.wte = new Param(V * C, s);
     this.wpe = new Param(T * C, s);
-    this.ln1g = new Param(C, 0); this.ln1g.data.fill(1);
-    this.ln1b = new Param(C, 0);
-    this.Wq = new Param(C * C, s); this.bq = new Param(C, 0);
-    this.Wk = new Param(C * C, s); this.bk = new Param(C, 0);
-    this.Wv = new Param(C * C, s); this.bv = new Param(C, 0);
-    this.Wo = new Param(C * C, s); this.bo = new Param(C, 0);
-    this.ln2g = new Param(C, 0); this.ln2g.data.fill(1);
-    this.ln2b = new Param(C, 0);
-    this.W1 = new Param(C * H, s); this.b1 = new Param(H, 0);
-    this.W2 = new Param(H * C, s); this.b2 = new Param(C, 0);
+    this.blocks = [];
+    for (let l = 0; l < nLayer; l++) this.blocks.push(new Block(C, H, s));
     this.lnfg = new Param(C, 0); this.lnfg.data.fill(1);
     this.lnfb = new Param(C, 0);
     this.Whead = new Param(C * V, s); this.bhead = new Param(V, 0);
     this.params = [
-      this.wte, this.wpe, this.ln1g, this.ln1b,
-      this.Wq, this.bq, this.Wk, this.bk, this.Wv, this.bv, this.Wo, this.bo,
-      this.ln2g, this.ln2b, this.W1, this.b1, this.W2, this.b2,
+      this.wte, this.wpe,
+      ...this.blocks.flatMap(b => b.params()),
       this.lnfg, this.lnfb, this.Whead, this.bhead,
     ];
     this.stepCount = 0;
@@ -234,67 +287,76 @@ export class CharTransformer {
       for (let c = 0; c < C; c++) x0[off + c] = this.wte.data[wteOff + c] + this.wpe.data[wpeOff + c];
     }
 
-    // ln1
-    const ln1 = this.lnFwd(x0, n, C, this.ln1g.data, this.ln1b.data);
-    // q,k,v
-    const q = this.linFwd(ln1.y, n, C, this.Wq.data, this.bq.data, C);
-    const k = this.linFwd(ln1.y, n, C, this.Wk.data, this.bk.data, C);
-    const v = this.linFwd(ln1.y, n, C, this.Wv.data, this.bv.data, C);
+    // Run each Transformer block in sequence, caching per-block activations.
+    const blockCaches: BlockCache[] = [];
+    let x = x0;
+    for (const block of this.blocks) {
+      const xin = x;
+      // ln1
+      const ln1 = this.lnFwd(xin, n, C, block.ln1g.data, block.ln1b.data);
+      // q,k,v
+      const q = this.linFwd(ln1.y, n, C, block.Wq.data, block.bq.data, C);
+      const k = this.linFwd(ln1.y, n, C, block.Wk.data, block.bk.data, C);
+      const v = this.linFwd(ln1.y, n, C, block.Wv.data, block.bv.data, C);
 
-    // single-head causal attention
-    const att = new Float32Array(n * n); // row-major lower triangular weights
-    const attOut = new Float32Array(n * C);
-    for (let i = 0; i < n; i++) {
-      // scores
-      let maxS = -Infinity;
-      const sRow = new Float32Array(i + 1);
-      for (let j = 0; j <= i; j++) {
-        let dot = 0;
-        const qi = i * C;
-        const kj = j * C;
-        for (let c = 0; c < C; c++) dot += q[qi + c] * k[kj + c];
-        dot *= scale;
-        sRow[j] = dot;
-        if (dot > maxS) maxS = dot;
+      // single-head causal attention
+      const att = new Float32Array(n * n); // row-major lower triangular weights
+      const attOut = new Float32Array(n * C);
+      for (let i = 0; i < n; i++) {
+        // scores
+        let maxS = -Infinity;
+        const sRow = new Float32Array(i + 1);
+        for (let j = 0; j <= i; j++) {
+          let dot = 0;
+          const qi = i * C;
+          const kj = j * C;
+          for (let c = 0; c < C; c++) dot += q[qi + c] * k[kj + c];
+          dot *= scale;
+          sRow[j] = dot;
+          if (dot > maxS) maxS = dot;
+        }
+        let sum = 0;
+        for (let j = 0; j <= i; j++) {
+          const e = Math.exp(sRow[j] - maxS);
+          sRow[j] = e;
+          sum += e;
+        }
+        for (let j = 0; j <= i; j++) {
+          const a = sRow[j] / sum;
+          att[i * n + j] = a;
+          const vj = j * C;
+          const oi = i * C;
+          for (let c = 0; c < C; c++) attOut[oi + c] += a * v[vj + c];
+        }
       }
-      let sum = 0;
-      for (let j = 0; j <= i; j++) {
-        const e = Math.exp(sRow[j] - maxS);
-        sRow[j] = e;
-        sum += e;
-      }
-      for (let j = 0; j <= i; j++) {
-        const a = sRow[j] / sum;
-        att[i * n + j] = a;
-        const vj = j * C;
-        const oi = i * C;
-        for (let c = 0; c < C; c++) attOut[oi + c] += a * v[vj + c];
-      }
+
+      // output projection
+      const proj = this.linFwd(attOut, n, C, block.Wo.data, block.bo.data, C);
+      // residual 1
+      const x1 = new Float32Array(n * C);
+      for (let i = 0; i < n * C; i++) x1[i] = xin[i] + proj[i];
+
+      // ln2
+      const ln2 = this.lnFwd(x1, n, C, block.ln2g.data, block.ln2b.data);
+      // mlp
+      const fc = this.linFwd(ln2.y, n, C, block.W1.data, block.b1.data, H); // [n,H]
+      const act = new Float32Array(n * H);
+      for (let i = 0; i < n * H; i++) act[i] = geluFwd(fc[i]);
+      const mlpOut = this.linFwd(act, n, H, block.W2.data, block.b2.data, C); // [n,C]
+      // residual 2
+      const x2 = new Float32Array(n * C);
+      for (let i = 0; i < n * C; i++) x2[i] = x1[i] + mlpOut[i];
+
+      blockCaches.push({ xin, ln1, q, k, v, att, attOut, x1, ln2, fc, act });
+      x = x2;
     }
 
-    // output projection
-    const proj = this.linFwd(attOut, n, C, this.Wo.data, this.bo.data, C);
-    // residual 1
-    const x1 = new Float32Array(n * C);
-    for (let i = 0; i < n * C; i++) x1[i] = x0[i] + proj[i];
-
-    // ln2
-    const ln2 = this.lnFwd(x1, n, C, this.ln2g.data, this.ln2b.data);
-    // mlp
-    const fc = this.linFwd(ln2.y, n, C, this.W1.data, this.b1.data, H); // [n,H]
-    const act = new Float32Array(n * H);
-    for (let i = 0; i < n * H; i++) act[i] = geluFwd(fc[i]);
-    const mlpOut = this.linFwd(act, n, H, this.W2.data, this.b2.data, C); // [n,C]
-    // residual 2
-    const x2 = new Float32Array(n * C);
-    for (let i = 0; i < n * C; i++) x2[i] = x1[i] + mlpOut[i];
-
     // final ln
-    const lnf = this.lnFwd(x2, n, C, this.lnfg.data, this.lnfb.data);
+    const lnf = this.lnFwd(x, n, C, this.lnfg.data, this.lnfb.data);
     // head
     const logits = this.linFwd(lnf.y, n, C, this.Whead.data, this.bhead.data, V);
 
-    return { n, seq, x0, ln1, q, k, v, att, attOut, x1, ln2, fc, act, x2, lnf, logits };
+    return { n, seq, x0, blockCaches, lnf, logits };
   }
 
   // Backprop a generic linear: given dy[n,o], x[n,k], W[k,o], accumulate
@@ -381,76 +443,84 @@ export class CharTransformer {
 
     // head backward
     const dLnfY = this.linBwd(dlogits, cache.lnf.y, n, C, V, this.Whead.data, this.Whead.grad, this.bhead.grad);
-    // final ln backward
-    const dx2 = this.lnBwd(dLnfY, cache.lnf.xhat, cache.lnf.rstd, n, C, this.lnfg.data, this.lnfg.grad, this.lnfb.grad);
+    // final ln backward -> gradient w.r.t. the last block's output (x2)
+    let dx = this.lnBwd(dLnfY, cache.lnf.xhat, cache.lnf.rstd, n, C, this.lnfg.data, this.lnfg.grad, this.lnfb.grad);
 
-    // residual 2: x2 = x1 + mlpOut -> dx1 += dx2 ; dmlpOut = dx2
-    const dMlpOut = dx2; // share; we'll also route to x1 at the end
-    // mlp backward
-    const dAct = this.linBwd(dMlpOut, cache.act, n, H, C, this.W2.data, this.W2.grad, this.b2.grad);
-    const dFc = new Float32Array(n * H);
-    for (let i = 0; i < n * H; i++) dFc[i] = dAct[i] * geluGrad(cache.fc[i]);
-    const dLn2Y = this.linBwd(dFc, cache.ln2.y, n, C, H, this.W1.data, this.W1.grad, this.b1.grad);
-    // ln2 backward -> dx1 contribution
-    const dx1FromLn2 = this.lnBwd(dLn2Y, cache.ln2.xhat, cache.ln2.rstd, n, C, this.ln2g.data, this.ln2g.grad, this.ln2b.grad);
+    // Walk the blocks in reverse, threading the residual-stream gradient `dx`.
+    for (let bi = this.blocks.length - 1; bi >= 0; bi--) {
+      const block = this.blocks[bi];
+      const bc = cache.blockCaches[bi];
 
-    // accumulate dx1 = dx2 (residual) + dx1FromLn2
-    const dx1 = new Float32Array(n * C);
-    for (let i = 0; i < n * C; i++) dx1[i] = dx2[i] + dx1FromLn2[i];
+      // residual 2: x2 = x1 + mlpOut -> dx1 += dx ; dmlpOut = dx
+      const dMlpOut = dx; // share; we'll also route to x1 at the end
+      // mlp backward
+      const dAct = this.linBwd(dMlpOut, bc.act, n, H, C, block.W2.data, block.W2.grad, block.b2.grad);
+      const dFc = new Float32Array(n * H);
+      for (let i = 0; i < n * H; i++) dFc[i] = dAct[i] * geluGrad(bc.fc[i]);
+      const dLn2Y = this.linBwd(dFc, bc.ln2.y, n, C, H, block.W1.data, block.W1.grad, block.b1.grad);
+      // ln2 backward -> dx1 contribution
+      const dx1FromLn2 = this.lnBwd(dLn2Y, bc.ln2.xhat, bc.ln2.rstd, n, C, block.ln2g.data, block.ln2g.grad, block.ln2b.grad);
 
-    // residual 1: x1 = x0 + proj -> dproj = dx1 ; dx0 += dx1
-    const dProj = dx1;
-    // output projection backward
-    const dAttOut = this.linBwd(dProj, cache.attOut, n, C, C, this.Wo.data, this.Wo.grad, this.bo.grad);
+      // accumulate dx1 = dx (residual) + dx1FromLn2
+      const dx1 = new Float32Array(n * C);
+      for (let i = 0; i < n * C; i++) dx1[i] = dx[i] + dx1FromLn2[i];
 
-    // attention backward
-    const dq = new Float32Array(n * C);
-    const dk = new Float32Array(n * C);
-    const dv = new Float32Array(n * C);
-    for (let i = 0; i < n; i++) {
-      const oi = i * C;
-      // da_ij and dv_j
-      const da = new Float32Array(i + 1);
-      for (let j = 0; j <= i; j++) {
-        const a = cache.att[i * n + j];
-        const vj = j * C;
-        let dot = 0;
-        for (let c = 0; c < C; c++) {
-          dv[vj + c] += a * dAttOut[oi + c];
-          dot += dAttOut[oi + c] * cache.v[vj + c];
+      // residual 1: x1 = xin + proj -> dproj = dx1 ; dxin += dx1
+      const dProj = dx1;
+      // output projection backward
+      const dAttOut = this.linBwd(dProj, bc.attOut, n, C, C, block.Wo.data, block.Wo.grad, block.bo.grad);
+
+      // attention backward
+      const dq = new Float32Array(n * C);
+      const dk = new Float32Array(n * C);
+      const dv = new Float32Array(n * C);
+      for (let i = 0; i < n; i++) {
+        const oi = i * C;
+        // da_ij and dv_j
+        const da = new Float32Array(i + 1);
+        for (let j = 0; j <= i; j++) {
+          const a = bc.att[i * n + j];
+          const vj = j * C;
+          let dot = 0;
+          for (let c = 0; c < C; c++) {
+            dv[vj + c] += a * dAttOut[oi + c];
+            dot += dAttOut[oi + c] * bc.v[vj + c];
+          }
+          da[j] = dot;
         }
-        da[j] = dot;
-      }
-      // softmax backward: ds_ij = a_ij*(da_ij - sum_j' a_ij'*da_ij')
-      let sa = 0;
-      for (let j = 0; j <= i; j++) sa += cache.att[i * n + j] * da[j];
-      for (let j = 0; j <= i; j++) {
-        const a = cache.att[i * n + j];
-        const ds = a * (da[j] - sa) * scale;
-        const qi = i * C;
-        const kj = j * C;
-        for (let c = 0; c < C; c++) {
-          dq[qi + c] += ds * cache.k[kj + c];
-          dk[kj + c] += ds * cache.q[qi + c];
+        // softmax backward: ds_ij = a_ij*(da_ij - sum_j' a_ij'*da_ij')
+        let sa = 0;
+        for (let j = 0; j <= i; j++) sa += bc.att[i * n + j] * da[j];
+        for (let j = 0; j <= i; j++) {
+          const a = bc.att[i * n + j];
+          const ds = a * (da[j] - sa) * scale;
+          const qi = i * C;
+          const kj = j * C;
+          for (let c = 0; c < C; c++) {
+            dq[qi + c] += ds * bc.k[kj + c];
+            dk[kj + c] += ds * bc.q[qi + c];
+          }
         }
       }
+
+      // q,k,v linear backward -> all into dLn1Y
+      const dLn1Y = new Float32Array(n * C);
+      const addInto = (src: Float32Array) => { for (let i = 0; i < n * C; i++) dLn1Y[i] += src[i]; };
+      addInto(this.linBwd(dq, bc.ln1.y, n, C, C, block.Wq.data, block.Wq.grad, block.bq.grad));
+      addInto(this.linBwd(dk, bc.ln1.y, n, C, C, block.Wk.data, block.Wk.grad, block.bk.grad));
+      addInto(this.linBwd(dv, bc.ln1.y, n, C, C, block.Wv.data, block.Wv.grad, block.bv.grad));
+
+      // ln1 backward -> dxin contribution
+      const dxinFromLn1 = this.lnBwd(dLn1Y, bc.ln1.xhat, bc.ln1.rstd, n, C, block.ln1g.data, block.ln1g.grad, block.ln1b.grad);
+
+      // dxin = dx1 (residual) + dxinFromLn1 ; becomes dx for the previous block
+      const dxin = new Float32Array(n * C);
+      for (let i = 0; i < n * C; i++) dxin[i] = dx1[i] + dxinFromLn1[i];
+      dx = dxin;
     }
 
-    // q,k,v linear backward -> all into dLn1Y
-    const dLn1Y = new Float32Array(n * C);
-    const addInto = (src: Float32Array) => { for (let i = 0; i < n * C; i++) dLn1Y[i] += src[i]; };
-    addInto(this.linBwd(dq, cache.ln1.y, n, C, C, this.Wq.data, this.Wq.grad, this.bq.grad));
-    addInto(this.linBwd(dk, cache.ln1.y, n, C, C, this.Wk.data, this.Wk.grad, this.bk.grad));
-    addInto(this.linBwd(dv, cache.ln1.y, n, C, C, this.Wv.data, this.Wv.grad, this.bv.grad));
-
-    // ln1 backward -> dx0 contribution
-    const dx0FromLn1 = this.lnBwd(dLn1Y, cache.ln1.xhat, cache.ln1.rstd, n, C, this.ln1g.data, this.ln1g.grad, this.ln1b.grad);
-
-    // dx0 = dx1 (residual) + dx0FromLn1
-    const dx0 = new Float32Array(n * C);
-    for (let i = 0; i < n * C; i++) dx0[i] = dx1[i] + dx0FromLn1[i];
-
-    // embeddings backward
+    // embeddings backward (dx is now dx0, the gradient at the embedding sum)
+    const dx0 = dx;
     for (let t = 0; t < n; t++) {
       const tok = cache.seq[t];
       const wteOff = tok * C;
